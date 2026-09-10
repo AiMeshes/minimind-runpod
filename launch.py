@@ -139,6 +139,8 @@ def build_pod_request(cfg: dict) -> dict:
         "volumeInGb": 0,
         # ports 是**数组**；默认值含 22/tcp，便于 SSH 调试
         "ports": split_list(cfg.get("PORTS", "8888/http,22/tcp")),
+        # Community Cloud 上需要显式请求公网 IP 才能 SSH 进去看日志
+        "supportPublicIp": cfg.get("PUBLIC_IP", "1") == "1",
         "env": env,
     }
 
