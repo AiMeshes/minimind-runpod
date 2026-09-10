@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""拉起一个跑 minimind 的 RunPod Pod。
+"""拉起一个跑 minimind 的 RunPod Pod（REST API）。
 
 用法:
-    export RUNPOD_API_KEY=rpa_...
+    cp .env.example .env      # 填入 RUNPOD_API_KEY、NETWORK_VOLUME_ID、IMAGE_NAME
+    python launch.py --config configs/64m-pretrain.env --dry-run
     python launch.py --config configs/64m-pretrain.env
+    python launch.py --list   # 查看现有 Pod
 
-前置条件:
-    - 已建好 network volume（checkpoint 靠它持久化，这是抗抢占的前提）
-    - 镜像已推到可公开拉取的 registry
+为什么用 REST 而不是 runpod Python SDK：
+    SDK 1.12.0（当前最新）的 create_pod **没有 spot 相关参数** ——
+    整个包里搜不到 interruptible / max_bid_price / SPOT。
+    而 REST 的 POST /v1/pods 支持 interruptible: true。
+    没有它就只能按需付费，成本翻倍。
 
-注意: RunPod API 迭代较快。首次运行前先确认参数名：
-    python -c "import runpod; print(runpod.create_pod.__doc__)"
+字段名以 OpenAPI spec 为准（https://rest.runpod.io/v1/openapi.json）：
+    camelCase；env 是**对象**不是 {key,value} 列表；ports 是**数组**。
 """
+from __future__ import annotations
+
 import argparse
+import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+API_BASE = os.environ.get("RUNPOD_REST_BASE", "https://rest.runpod.io/v1")
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 def load_env_file(path: str) -> dict:
-    """读取 KEY=VALUE 形式的配置文件，忽略注释和空行。
+    """读取 KEY=VALUE 配置文件，忽略注释和空行。
 
     只剥离「空白 + #」形式的行内注释，这样值里合法出现的 # 不会被误删
     （例如 URL 的 fragment、或不含空格的 token）。
@@ -32,7 +44,6 @@ def load_env_file(path: str) -> dict:
         if "=" not in line:
             raise ValueError(f"配置行缺少 '=': {raw!r}")
         k, v = line.split("=", 1)
-        # 剥离行内注释：' #' 之后的都算注释
         for i, ch in enumerate(v):
             if ch == "#" and i > 0 and v[i - 1] in " \t":
                 v = v[:i]
@@ -41,63 +52,144 @@ def load_env_file(path: str) -> dict:
     return env
 
 
+def load_dotenv_if_present() -> None:
+    """把仓库根目录的 .env 注入环境变量（已存在的同名变量不覆盖）。"""
+    env_path = REPO_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for key, value in load_env_file(str(env_path)).items():
+        os.environ.setdefault(key, value)
+
+
+# ---------------------------------------------------------------------------
+# REST 客户端
+# ---------------------------------------------------------------------------
+def api_request(method: str, path: str, body: dict | None = None) -> object:
+    """调用 RunPod REST API。
+
+    User-Agent 是必需的 —— 缺失会被 Cloudflare 以 403 拒绝。
+    """
+    api_key = os.environ.get("RUNPOD_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "错误: 未设置 RUNPOD_API_KEY。"
+            "写入 .env（见 .env.example）或 export 到环境变量。")
+
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"{API_BASE}{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "minimind-runpod/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="ignore")[:500]
+        raise SystemExit(f"API {method} {path} 失败: HTTP {exc.code}\n{detail}") from exc
+
+
+# ---------------------------------------------------------------------------
+# 请求构造
+# ---------------------------------------------------------------------------
+def split_list(value: str) -> list[str]:
+    """把 "a, b, c" 拆成列表；空字符串返回空列表。"""
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 def build_pod_request(cfg: dict) -> dict:
+    """按 OpenAPI 的 PodCreateInput 构造请求体。
+
+    字段名与类型严格对齐 spec —— 写错只会在真实调用时才发现，
+    所以这里每个字段都对照过 https://rest.runpod.io/v1/openapi.json
+    """
     gpu_count = int(cfg.get("GPU_COUNT", 1))
 
-    # 传进容器的环境变量（entrypoint.sh 读取）
-    container_env = [
-        {"key": "DATA_URL", "value": cfg.get("DATA_URL", "")},
-        {"key": "MINIMIND_REPO", "value": cfg.get(
-            "MINIMIND_REPO", "https://github.com/AiMeshes/minimind.git")},
-        {"key": "NUM_GPUS", "value": str(gpu_count)},
-        {"key": "RESTART_DELAY", "value": cfg.get("RESTART_DELAY", "15")},
-    ]
-    # 训练超参走环境变量，不走 docker_args ——
-    # docker_args 在 RunPod 里是「容器启动命令」，不是「追加参数」，
-    # 用它传超参会把 entrypoint 整个替换掉。entrypoint.sh 会读取本变量。
-    if cfg.get("TRAIN_ARGS"):
-        container_env.append({"key": "TRAIN_ARGS", "value": cfg["TRAIN_ARGS"]})
+    # env 在 REST 里是**对象**，不是 SDK 那样的 [{key,value}] 列表
+    env: dict[str, str] = {
+        "MINIMIND_REPO": cfg.get(
+            "MINIMIND_REPO", "https://github.com/AiMeshes/minimind.git"),
+        "NUM_GPUS": str(gpu_count),
+        "RESTART_DELAY": cfg.get("RESTART_DELAY", "15"),
+    }
+    for opt in ("DATA_URL", "TRAIN_ARGS", "START_SSHD", "HF_TOKEN", "WANDB_API_KEY"):
+        if cfg.get(opt):
+            env[opt] = cfg[opt]
 
-    if cfg.get("HF_TOKEN"):
-        container_env.append({"key": "HF_TOKEN", "value": cfg["HF_TOKEN"]})
-    if cfg.get("WANDB_API_KEY"):
-        container_env.append({"key": "WANDB_API_KEY", "value": cfg["WANDB_API_KEY"]})
-    if cfg.get("START_SSHD"):
-        container_env.append({"key": "START_SSHD", "value": cfg["START_SSHD"]})
-
-    req = {
+    req: dict = {
         "name": cfg.get("POD_NAME", "minimind-train"),
-        "image_name": cfg["IMAGE_NAME"],
-        "gpu_type_id": cfg.get("GPU_TYPE", "NVIDIA GeForce RTX 4090"),
-        "gpu_count": gpu_count,
-        "cloud_type": cfg.get("CLOUD_TYPE", "COMMUNITY"),
+        "imageName": cfg["IMAGE_NAME"],
+        "gpuTypeIds": split_list(cfg.get("GPU_TYPE", "NVIDIA GeForce RTX 4090")),
+        "gpuCount": gpu_count,
+        "cloudType": cfg.get("CLOUD_TYPE", "COMMUNITY"),
         # Spot：便宜约 50%，但随时可能被抢占 —— 抗抢占能力正是本外壳的存在理由
         "interruptible": cfg.get("INTERRUPTIBLE", "1") == "1",
-        "container_disk_in_gb": int(cfg.get("CONTAINER_DISK_GB", 40)),
-        # 不用 volume disk（停机后涨价到 $0.20/GB/月，见 cost-guide §5）
-        "volume_in_gb": 0,
-        "network_volume_id": cfg["NETWORK_VOLUME_ID"],
-        "ports": cfg.get("PORTS", "8888/http"),
-        "env": container_env,
+        "containerDiskInGb": int(cfg.get("CONTAINER_DISK_GB", 50)),
+        # 显式用 0：volume disk 停机后涨到 $0.20/GB/月，是全平台最贵的存储
+        # （见成本指南 §5）。checkpoint 靠 network volume 持久化，不需要它。
+        "volumeInGb": 0,
+        # ports 是**数组**；默认值含 22/tcp，便于 SSH 调试
+        "ports": split_list(cfg.get("PORTS", "8888/http,22/tcp")),
+        "env": env,
     }
+
+    if cfg.get("NETWORK_VOLUME_ID"):
+        req["networkVolumeId"] = cfg["NETWORK_VOLUME_ID"]
+    if cfg.get("DATA_CENTER_IDS"):
+        # network volume 是地域锁定的：Pod 必须在 volume 所在机房
+        req["dataCenterIds"] = split_list(cfg["DATA_CENTER_IDS"])
+    if cfg.get("DOCKER_START_CMD"):
+        req["dockerStartCmd"] = split_list(cfg["DOCKER_START_CMD"])
+    if cfg.get("DOCKER_ENTRYPOINT"):
+        req["dockerEntrypoint"] = split_list(cfg["DOCKER_ENTRYPOINT"])
 
     return req
 
 
+def cmd_list() -> int:
+    pods = api_request("GET", "/pods") or []
+    if not pods:
+        print("无任何 Pod —— 没有在偷偷烧钱")
+        return 0
+    total = 0.0
+    print(f"{'ID':<22} {'名称':<24} {'状态':<12} {'$/hr':>7}  中断")
+    print("-" * 76)
+    for p in pods:
+        cost = p.get("costPerHr") or 0
+        if p.get("desiredStatus") == "RUNNING":
+            total += cost
+        print(f"{p.get('id',''):<22} {p.get('name',''):<24} "
+              f"{p.get('desiredStatus',''):<12} {cost:>7.3f}  "
+              f"{'是' if p.get('interruptible') else '否'}")
+    print("-" * 76)
+    print(f"运行中合计: ${total:.3f}/hr  →  ${total * 24:.2f}/天  ${total * 730:.2f}/月")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="拉起 minimind 训练 Pod")
-    ap.add_argument("--config", required=True, help="配置文件路径")
+    ap.add_argument("--config", help="配置文件路径")
     ap.add_argument("--dry-run", action="store_true", help="只打印请求，不实际创建")
+    ap.add_argument("--list", action="store_true", help="列出所有 Pod 及花费")
     args = ap.parse_args()
 
-    # RUNPOD_API_KEY 必须在 import runpod 之前进入环境（构造函数在实例化时读凭据）
-    api_key = os.environ.get("RUNPOD_API_KEY")
-    if not api_key:
-        print("错误: 未设置 RUNPOD_API_KEY", file=sys.stderr)
-        return 1
+    # 必须在任何 API 调用之前
+    load_dotenv_if_present()
+
+    if args.list:
+        return cmd_list()
+
+    if not args.config:
+        ap.error("需要 --config（或用 --list）")
 
     cfg = load_env_file(args.config)
-    for required in ("IMAGE_NAME", "NETWORK_VOLUME_ID"):
+    for required in ("IMAGE_NAME",):
         if not cfg.get(required):
             print(f"错误: 配置缺少 {required}", file=sys.stderr)
             return 1
@@ -105,19 +197,19 @@ def main() -> int:
     req = build_pod_request(cfg)
 
     if args.dry_run:
-        import json
         print(json.dumps(req, indent=2, ensure_ascii=False))
         return 0
 
-    import runpod  # noqa: E402
-
-    pod = runpod.create_pod(**req)
+    pod = api_request("POST", "/pods", req)
     pod_id = pod.get("id") if isinstance(pod, dict) else pod
     print(f"Pod 已创建: {pod_id}")
-    print(f"监控台: https://www.console.runpod.io/pods")
-    print()
-    print("注意: 建 Pod 前请确认 network volume 与所选 GPU 在同一个数据中心，")
-    print("      否则 RunPod 会报错找不到可用机器（volume 是地域锁定的）。")
+    print(f"  计费: ${pod.get('costPerHr', '?')}/hr"
+          f"  中断式: {'是（Spot）' if req['interruptible'] else '否'}")
+    print(f"  面板: https://www.console.runpod.io/pods")
+    if cfg.get("NETWORK_VOLUME_ID"):
+        print()
+        print(f"  提示: network volume {cfg['NETWORK_VOLUME_ID']} 是地域锁定的，")
+        print(f"        若 Pod 起不来，多半是该机房没有 GPU_TYPE 的现货。")
     return 0
 
 

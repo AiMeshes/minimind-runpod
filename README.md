@@ -48,6 +48,33 @@ lm_checkpoint(lm_config, weight=args.save_weight, ..., save_dir='../checkpoints'
 
 ---
 
+## 为什么用 REST API 而不是 runpod Python SDK
+
+**SDK 1.12.0（当前最新版）建不出 Spot Pod。** 整个包里搜不到
+`interruptible` / `max_bid_price` / `SPOT`，`create_pod` 的参数表里没有 spot 相关项。
+
+而 REST 的 `POST /v1/pods` 支持 `"interruptible": true`。没有它就只能按需付费，
+**成本翻倍** —— 对一个要跑几天的训练，这是 $1000 量级的差别。
+
+两套 API 的字段格式完全不同，别混用：
+
+| | SDK `create_pod` | REST `POST /v1/pods` |
+|---|---|---|
+| 命名 | `snake_case` | `camelCase` |
+| 环境变量 | `env=[{key,value}]` | `env={k: v}` **对象** |
+| 端口 | 字符串 `"8888/http"` | **数组** `["8888/http"]` |
+| GPU | `gpu_type_id`（单个） | `gpuTypeIds`（**数组**） |
+| Spot | ✗ 不支持 | `interruptible: true` |
+
+字段名以 OpenAPI spec 为准（`https://rest.runpod.io/v1/openapi.json`，
+可匿名访问）。`tests/verify_watch.py` 里有对照 33 个合法字段的一致性检查。
+
+> 状态字段 `desiredStatus` 的合法值是 **`RUNNING` / `EXITED` / `TERMINATED`**，
+> **没有 `STOPPED`**。被抢占后是 `EXITED`（可以 start 恢复），
+> `TERMINATED` 是彻底删除（只能重建）。搞错会导致抢占后永远不恢复。
+
+---
+
 ## 快速开始
 
 ### 1. 构建镜像
@@ -63,31 +90,38 @@ docker push <你的dockerhub>/minimind-runpod:latest
 
 在 RunPod console 创建，**记住机房** —— volume 是地域锁定的，只有同机房的 GPU 能用它。
 
-### 3. 配置
+### 3. 配置凭据
+
+```bash
+cp .env.example .env      # 填入 RUNPOD_API_KEY
+chmod 600 .env
+```
+
+`.env` 已被 `.gitignore` 排除。`launch.py` / `watch.py` 自动读取它，不必先 `export`。
+
+### 4. 配置本次训练
 
 ```bash
 cp configs/64m-pretrain.env configs/my-run.env
 # 填入 NETWORK_VOLUME_ID 和 IMAGE_NAME
 ```
 
-### 4. 启动
+### 5. 启动
 
 ```bash
-export RUNPOD_API_KEY=rpa_...
-python launch.py --config configs/my-run.env
+python launch.py --config configs/my-run.env --dry-run   # 先看请求体
+python launch.py --config configs/my-run.env             # 真创建
+python launch.py --list                                  # 查看现有 Pod 及花费
 ```
 
-先用 `--dry-run` 检查请求内容，首次运行前建议确认 API 参数名：
+`--dry-run` 会打印完整的请求体。字段名对照过 OpenAPI spec
+（`https://rest.runpod.io/v1/openapi.json`），但**第一次真实创建仍建议在面板上复核**。
+
+### 6. 挂上监控（强烈建议）
 
 ```bash
-python -c "import runpod; print(runpod.create_pod.__doc__)"
-```
-
-### 5. 挂上监控（强烈建议）
-
-```bash
-# crontab -e，每 20 分钟检查一次
-*/20 * * * * cd ~/minimind-runpod && RUNPOD_API_KEY=rpa_... /usr/bin/python3 watch.py --config configs/my-run.env >> ~/minimind-watch.log 2>&1
+# crontab -e，每 20 分钟检查一次（凭据从 .env 读，不用写在 crontab 里）
+*/20 * * * * cd ~/minimind-runpod && /usr/bin/python3 watch.py --config configs/my-run.env >> ~/minimind-watch.log 2>&1
 ```
 
 **RunPod 被抢占的 Pod 不会自己重启** —— 这是 `watch.py` 存在的唯一理由。
@@ -104,10 +138,14 @@ python -c "import runpod; print(runpod.create_pod.__doc__)"
 |---|---|
 | `Dockerfile` | 只装依赖，不打代码（镜像小、启动快、总是拿最新代码） |
 | `entrypoint.sh` | 数据准备 + supervisor 主循环 |
-| `launch.py` | 拉起 Pod |
-| `watch.py` | 监控 + 抢占后自动重建 |
-| `configs/*.env` | 配置 |
+| `launch.py` | 拉起 Pod（REST API，含 `--dry-run` / `--list`） |
+| `watch.py` | 监控 + 抢占后自动重建（`--status` 只读） |
+| `configs/*.env` | 训练配置 |
+| `.env.example` | 凭据模板 → 复制为 `.env`（已被 gitignore） |
 | `tests/` | 本地验证（CPU，不花钱）—— 见上节 |
+
+> `launch.py` / `watch.py` **只用 Python 标准库**（`urllib`），不需要装任何依赖。
+> 本地跑它们只要有 Python 3.9+；`tests/verify_resume.py` 才需要 torch 等。
 
 ### supervisor 的几个设计点
 
@@ -172,17 +210,23 @@ bash tests/run_all.sh
 
 ### 3. `watch.py` 的判断对不对？
 
-`tests/verify_watch.py` 用假的 `runpod` 模块覆盖每种 Pod 状态。这个脚本判断错了
+`tests/verify_watch.py` 用假的 API 客户端覆盖每种 Pod 状态。这个脚本判断错了
 只有两种后果，都很贵：**该恢复时不恢复**（训练停摆）或**不该动时乱动**（重复创建，白烧两份钱）。
 
 | Pod 状态 | 期望行为 |
 |---|---|
 | RUNNING | 不做任何写操作 |
-| STOPPED（被抢占） | `start_pod`（保留容器，比重建快） |
-| 不存在 | 新建，且挂载 volume + 启用 spot |
-| STOPPED 但 start 失败 | 退回新建（不卡在启动不了的 Pod 上） |
+| EXITED（被抢占） | `start`（保留容器，比重建快） |
+| 不存在 / TERMINATED | 新建，且挂载 volume + 启用 spot |
+| EXITED 但 start 失败 | 退回新建（不卡在启动不了的 Pod 上） |
 | API 查询故障 | 退出 0 且不新建（避免网络抖动导致重复创建） |
 | `--force` | 无视运行中的 Pod 直接新建 |
+| `--status` | 只报告，不做任何变更 |
+
+同时做两项静态自查：
+
+- **请求体字段名**对照 OpenAPI spec 的 33 个合法字段（camelCase）
+- **状态枚举**：`watch.py` 里不得出现 `STOPPED`（该值不存在，会导致抢占后永不恢复）
 
 ### 附：构建镜像前的依赖检查
 
@@ -231,8 +275,10 @@ bash tests/check_docker_deps.sh
 - **tokenizer 从 `../model/` 加载**（`trainer_utils.py:120`）—— 已包含在 minimind 仓库内，无需额外准备
 - **`PretrainDataset` 全量载入内存**（`dataset/lm_dataset.py`，用 `load_dataset('json', ...)`）。64M–350M 量级没问题；放大到 1B / 200B tokens 时需要换成流式或预 tokenize 的 memmap（见成本指南 §9.4）
 - **默认不启动 sshd**。本镜像覆盖了基座 ENTRYPOINT，会丢掉 RunPod 的 `/start.sh`（它负责 sshd 和 Jupyter）。设 `START_SSHD=1` 并在 console 配置公钥可恢复 SSH。取舍：保持默认则启动更快（按秒计费），需要调试时再开
-- **`watch.py` v1 用 Pod 状态判断存活**，不读心跳文件。Pod 显示 running 但进程卡死的边缘情况检测不到 —— 需要更精确判断时可接 RunPod S3 API 读心跳
-- **训练超参走 `TRAIN_ARGS` 环境变量，不走 `docker_args`**。RunPod 的 `docker_args` 是「容器启动命令」而非「追加参数」，用它传超参会把 entrypoint 整个替换掉
+- **`watch.py` 用 Pod 状态判断存活**，不读心跳文件。Pod 显示 RUNNING 但训练进程已卡死的情况检测不到 —— 需要更精确判断时可接 RunPod S3 API 读 `/workspace/.supervisor/heartbeat`（`entrypoint.sh` 每 30 秒写一次）
+- **训练超参走 `TRAIN_ARGS` 环境变量，不走 `dockerStartCmd`**。后者是「容器启动命令」而非「追加参数」，用它传超参会把 entrypoint 整个替换掉
+- **`volumeInGb` 显式设为 0**。volume disk 停机后涨到 $0.20/GB/月（全平台最贵存储），而 checkpoint 靠 network volume 持久化，不需要它
+- **未在真实 Pod 上端到端验证过**。请求体字段名已对照 OpenAPI spec 校验、逻辑已用假客户端覆盖，但真实创建、镜像构建、以及 RunPod 抢占时是转 `EXITED` 还是直接 `TERMINATED` 都需要首次上云时确认（`watch.py` 两条路径都实现了）
 
 ---
 
