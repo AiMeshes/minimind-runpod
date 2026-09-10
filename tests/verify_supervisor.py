@@ -112,6 +112,9 @@ def run_case(name: str, sequence: str, *, sleep_seq: str = "",
         "FAKE_SEQUENCE": sequence,
         "FAKE_LOG": str(fake_log),
         "FAKE_COUNT_FILE": str(count_file),
+        # 本测试只验证 supervisor 的重启/熔断逻辑，不涉及依赖安装。
+        # 关掉它 —— 否则会真的去 pip install（慢，且与本测试无关）。
+        "INSTALL_DEPS": "0",
     })
     if sleep_seq:
         env["FAKE_SLEEP_SEQ"] = sleep_seq

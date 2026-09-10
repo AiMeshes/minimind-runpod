@@ -13,6 +13,9 @@ MINIMIND_REPO="${MINIMIND_REPO:-https://github.com/AiMeshes/minimind.git}"
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')}"
 NUM_GPUS="${NUM_GPUS:-1}"
 SUPERVISOR_STATE="$WORKSPACE/.supervisor"
+# 训练输出同时写文件：RunPod 的 REST API 没有日志端点，
+# 出问题只能 SSH 进容器看。放 /workspace 以便挂在 network volume 上时也能留存。
+TRAIN_LOG="${TRAIN_LOG:-$WORKSPACE/train.log}"
 RESTART_DELAY="${RESTART_DELAY:-15}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
 
@@ -218,21 +221,25 @@ main() {
         # GPU 数变化时它还会自动换算 step（trainer_utils.py:110-114）
         # 注意：set -u 下展开空数组在 bash 3.2 会报 unbound variable，
         # 所以这里用条件分支而不是直接展开（兼容性，且行为更显式）
+        #
+        # 输出用 tee 同时写日志文件和 stdout（RunPod 控制台可见）。
+        # 管道会吃掉退出码 —— 必须取 PIPESTATUS[0]（torchrun 的），
+        # 而不是 $?（tee 的），否则所有失败都会被当成成功。
         if [ ${#train_args[@]} -gt 0 ]; then
             torchrun \
                 --nproc_per_node="$NUM_GPUS" \
                 --master_port="${MASTER_PORT:-29500}" \
                 train_pretrain.py \
                 --from_resume 1 \
-                "${train_args[@]}"
+                "${train_args[@]}" 2>&1 | tee -a "$TRAIN_LOG"
         else
             torchrun \
                 --nproc_per_node="$NUM_GPUS" \
                 --master_port="${MASTER_PORT:-29500}" \
                 train_pretrain.py \
-                --from_resume 1
+                --from_resume 1 2>&1 | tee -a "$TRAIN_LOG"
         fi
-        local code=$?
+        local code=${PIPESTATUS[0]}
         local elapsed=$(( $(date +%s) - start_ts ))
 
         if [ $code -eq 0 ]; then
