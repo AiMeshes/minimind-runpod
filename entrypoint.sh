@@ -16,6 +16,12 @@ SUPERVISOR_STATE="$WORKSPACE/.supervisor"
 RESTART_DELAY="${RESTART_DELAY:-15}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
 
+# 快速失败熔断：连续 N 次「运行不足 M 秒就退出」则停止重试并退出。
+# 用来区分「被抢占」（跑了几小时才挂）和「配置写错了」（秒挂）——
+# 后者无限重试只是在烧钱。
+FAST_FAIL_SECONDS="${FAST_FAIL_SECONDS:-60}"
+FAST_FAIL_LIMIT="${FAST_FAIL_LIMIT:-5}"
+
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 mkdir -p "$WORKSPACE" "$SUPERVISOR_STATE"
@@ -82,12 +88,15 @@ prepare_data() {
 # 3. 心跳：供外部监控判断存活（watch.py 用它决定是否重建 Pod）
 # ---------------------------------------------------------------------------
 start_heartbeat() {
+    # 刻意把子进程的 stdio 重定向到 /dev/null：
+    # 若它继承 supervisor 的 stdout，被 kill 时正卡在 sleep 里的孤儿进程
+    # 会继续持有该管道，导致调用方（docker logs / 父进程）迟迟等不到 EOF。
     (
         while true; do
             date -u +%s > "$SUPERVISOR_STATE/heartbeat"
             sleep "$HEARTBEAT_INTERVAL"
         done
-    ) &
+    ) >/dev/null 2>&1 &
     HEARTBEAT_PID=$!
     echo "$HEARTBEAT_PID" > "$SUPERVISOR_STATE/heartbeat.pid"
 }
@@ -181,18 +190,20 @@ main() {
             break
         fi
 
-        log "训练异常退出 code=$code（耗时 ${elapsed}s）"
+        # 注意 ${code} 的花括号是必需的：紧跟全角括号时，bash 3.2（macOS 自带）
+        # 不做 UTF-8 感知，会把括号的字节当成变量名的一部分
+        log "训练异常退出 code=${code}（耗时 ${elapsed}s）"
 
         # 快速连续失败说明是配置/环境问题，不是抢占 —— 退避避免烧钱
-        if [ "$elapsed" -lt 60 ]; then
+        if [ "$elapsed" -lt "$FAST_FAIL_SECONDS" ]; then
             consecutive_fast_fails=$((consecutive_fast_fails + 1))
         else
             consecutive_fast_fails=0
         fi
 
-        if [ "$consecutive_fast_fails" -ge 5 ]; then
-            log "连续 $consecutive_fast_fails 次快速失败，疑似配置错误而非抢占。"
-            log "保留现场并退出，避免继续烧钱。请检查日志。"
+        if [ "$consecutive_fast_fails" -ge "$FAST_FAIL_LIMIT" ]; then
+            log "连续 $consecutive_fast_fails 次快速失败（每次 < ${FAST_FAIL_SECONDS}s），"
+            log "疑似配置错误而非抢占。保留现场并退出，避免继续烧钱。请检查日志。"
             exit 1
         fi
 

@@ -107,12 +107,68 @@ python -c "import runpod; print(runpod.create_pod.__doc__)"
 | `launch.py` | 拉起 Pod |
 | `watch.py` | 监控 + 抢占后自动重建 |
 | `configs/*.env` | 配置 |
+| `tests/` | 本地验证（CPU，不花钱）—— 见上节 |
 
 ### supervisor 的几个设计点
 
-- **快速失败退避**：连续 5 次在 60 秒内失败就停止重试并退出。这区分了"被抢占"（跑了几小时才挂）和"配置写错了"（秒挂），避免后者无限重试烧钱
+- **快速失败退避**：连续 `FAST_FAIL_LIMIT`（默认 5）次在 `FAST_FAIL_SECONDS`（默认 60）内失败就停止重试并退出。这区分了"被抢占"（跑了几小时才挂）和"配置写错了"（秒挂），避免后者无限重试烧钱
 - **心跳文件**：`$WORKSPACE/.supervisor/heartbeat`，供需要更精确存活判断时使用
 - **数据幂等**：`.ready` 哨兵 + 临时文件原子 rename，抢占后重跑不会留下半份数据
+
+---
+
+## 本地验证（不需要 GPU，不花钱）
+
+整个抗抢占设计建立在两个假设上。它们都可以**在本地用 CPU 证伪** ——
+如果错了，上云跑几天才发现就太贵了。
+
+```bash
+# 首次建环境（uv）
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python torch transformers==4.57.6 datasets==3.6.0
+
+# 跑全套
+bash tests/run_all.sh
+```
+
+约 40 秒跑完，两项验证：
+
+### 1. 断点续训真的成立吗？
+
+`tests/verify_resume.py` 用 0.53M 参数的极小模型在 CPU 上训练，
+在**训练进行到 60% 时 SIGKILL**（不给任何优雅退出的机会），然后用
+`--from_resume 1` 重启，断言：
+
+| 断言 | 意义 |
+|---|---|
+| checkpoint 落在 `../checkpoints/` | 硬编码路径约定成立 → 放 network volume 即可持久化 |
+| checkpoint 含 model/optimizer/epoch/step | 恢复所需状态完整 |
+| 续训跳过正确的 step 数、从正确的 epoch 开始 | 真的接续了，不是重跑 |
+| **学习率与余弦调度曲线吻合** | ⭐ scheduler 状态被恢复 |
+| 续训处 lr 已比初始值低 70%+ | 保证上一条有鉴别力（否则接续和重置无法区分） |
+
+最后两条是关键。如果在 60% 处续训后 lr 跳回初始值，就说明只恢复了模型权重、
+调度器被重置 —— 训练动力学已经错乱，而这种错误不会报错，只会让结果变差。
+
+> **为什么要跑到 60% 才杀**：minimind 用余弦调度 `lr·(0.1+0.45·(1+cos(π·t/T)))`。
+> 在训练前 10% 处 lr 几乎等于初始值，此时"是否恢复"根本无从区分。60% 处
+> lr 已降到约 41%，重置会立刻暴露。
+
+### 2. supervisor 能区分「被抢占」和「配置错误」吗？
+
+`tests/verify_supervisor.py` 用假的 `torchrun`（放在 PATH 最前）精确编排退出行为：
+
+| 场景 | 期望 | 为什么重要 |
+|---|---|---|
+| 训练正常结束 | 退出 0，不重启 | — |
+| 崩两次后成功 | 重启到成功为止 | 基本恢复能力 |
+| 连续 5 次秒挂 | **熔断退出 1** | 配置写错时无限重试 = 无限烧钱 |
+| 跑 2s 后失败 8 次 | **不熔断，持续重启** | 这才是抢占的表现，误判则永远无法恢复 |
+
+第 3、4 条的区别是整个熔断逻辑的关键：抢占是"跑了几小时才挂"，
+配置错误是"秒挂"。分不清这两者，要么被抢占后不恢复，要么配置写错时烧钱。
+
+同时做静态检查：`$VAR` 后紧跟非 ASCII 字符在 bash 3.2 下会解析错误（见下）。
 
 ---
 
@@ -136,6 +192,9 @@ python -c "import runpod; print(runpod.create_pod.__doc__)"
 
 ## 已知限制
 
+- **上游对 `../out/*.pth` 是非原子写**（`train_pretrain.py:68` 直接 `torch.save` 到目标路径）。若抢占恰好落在该保存窗口，这个文件可能损坏。
+  **不影响续训** —— `--from_resume 1` 只读 `../checkpoints/*_resume.pth`（该路径由 `lm_checkpoint` 用 `.tmp` + `os.replace` 原子写入）。且训练继续后下次保存会覆盖它。只有在"抢占后**永久停止**训练、又想把 `out/` 权重用于下一阶段"这个组合下才会踩到。
+- **`$VAR` 后紧跟非 ASCII 字符在 bash 3.2 下会解析错误**。macOS 自带的就是 bash 3.2，它不做 UTF-8 感知，会把中文字节的当成变量名的一部分（如 `$code（` → 变量 `code\xef\xbc\x88` → unbound variable）。**一律写 `${VAR}`**。容器里是 bash 5 不会踩到，但本地测试会 —— `tests/verify_supervisor.py` 里有静态检查防回归。
 - **HF 缓存会吃 network volume 空间**。基座镜像把 `HF_HOME` 指向 `/workspace/.cache/huggingface/`，而 `/workspace` 就是 volume 挂载点。如果用 `datasets` 从 HF 拉数据，缓存会常驻并计费（$0.07/GB/月）。**不需要跨 pod 复用时，在 entrypoint 里 `rm -rf` 掉或把 `HF_HOME` 改到容器盘。**
 - **tokenizer 从 `../model/` 加载**（`trainer_utils.py:120`）—— 已包含在 minimind 仓库内，无需额外准备
 - **`PretrainDataset` 全量载入内存**（`dataset/lm_dataset.py`，用 `load_dataset('json', ...)`）。64M–350M 量级没问题；放大到 1B / 200B tokens 时需要换成流式或预 tokenize 的 memmap（见成本指南 §9.4）
