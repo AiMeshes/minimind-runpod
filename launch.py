@@ -118,7 +118,10 @@ def build_pod_request(cfg: dict) -> dict:
         "NUM_GPUS": str(gpu_count),
         "RESTART_DELAY": cfg.get("RESTART_DELAY", "15"),
     }
-    for opt in ("DATA_URL", "TRAIN_ARGS", "START_SSHD", "HF_TOKEN", "WANDB_API_KEY"):
+    # 逐个转发给 entrypoint.sh 的可选配置。漏掉一项 = 配置静默失效，
+    # 所以 tests/verify_watch.py 里对此有断言。
+    for opt in ("DATA_URL", "TRAIN_ARGS", "START_SSHD", "HF_TOKEN", "WANDB_API_KEY",
+                "INSTALL_DEPS", "PIP_PACKAGES", "PIP_PROBE"):
         if cfg.get(opt):
             env[opt] = cfg[opt]
 
@@ -144,8 +147,20 @@ def build_pod_request(cfg: dict) -> dict:
     if cfg.get("DATA_CENTER_IDS"):
         # network volume 是地域锁定的：Pod 必须在 volume 所在机房
         req["dataCenterIds"] = split_list(cfg["DATA_CENTER_IDS"])
-    if cfg.get("DOCKER_START_CMD"):
+
+    # 用官方镜像时，entrypoint.sh 不在镜像里，需要运行时拉取。
+    # 单独用 BOOTSTRAP_URL 而不是通用的 dockerStartCmd，是因为后者按逗号拆分，
+    # 会把 URL 或脚本内容切碎。
+    if cfg.get("BOOTSTRAP_URL"):
+        url = cfg["BOOTSTRAP_URL"]
+        req["dockerStartCmd"] = [
+            "bash", "-c",
+            f"set -e; curl -fsSL {url} -o /opt/mm-entrypoint.sh; "
+            f"exec bash /opt/mm-entrypoint.sh",
+        ]
+    elif cfg.get("DOCKER_START_CMD"):
         req["dockerStartCmd"] = split_list(cfg["DOCKER_START_CMD"])
+
     if cfg.get("DOCKER_ENTRYPOINT"):
         req["dockerEntrypoint"] = split_list(cfg["DOCKER_ENTRYPOINT"])
 

@@ -85,6 +85,55 @@ prepare_data() {
 }
 
 # ---------------------------------------------------------------------------
+# 2.5 依赖准备（用官方镜像时必须；自建镜像里已装好则秒过）
+#
+#     官方 runpod/pytorch 镜像只有 torch，没有 transformers/datasets。
+#     这里按需补装 —— 已装好时只做一次 import 检查，几乎不耗时。
+#
+#     取舍：自建镜像启动快（预装好），官方镜像零构建成本。
+#     官方镜像每次启动多花几分钟 ≈ $0.0x，先用它跑通流程更划算。
+# ---------------------------------------------------------------------------
+prepare_deps() {
+    if [ "${INSTALL_DEPS:-1}" != "1" ]; then
+        log "INSTALL_DEPS!=1，跳过依赖检查"
+        return 0
+    fi
+
+    local pkgs="${PIP_PACKAGES:-transformers==4.57.6 datasets==3.6.0}"
+    local probe="${PIP_PROBE:-transformers datasets}"
+
+    # 快路径：能 import 就说明装好了，直接跳过（自建镜像走这条）
+    if python -c "
+import importlib, sys
+for m in '${probe}'.split():
+    importlib.import_module(m)
+" 2>/dev/null; then
+        log "依赖已就绪，跳过安装"
+        return 0
+    fi
+
+    log "补装依赖: ${pkgs}"
+    log "（官方镜像不含这些包，首次启动需要几分钟。自建镜像可省去此步）"
+
+    # shellcheck disable=SC2086  # 有意按空格拆分
+    if ! python -m pip install --no-cache-dir --quiet ${pkgs}; then
+        log "依赖安装失败 —— 检查网络或包名"
+        return 1
+    fi
+
+    if ! python -c "
+import importlib
+for m in '${probe}'.split():
+    importlib.import_module(m)
+" 2>/dev/null; then
+        log "安装后仍无法 import ${probe}，请检查包名"
+        return 1
+    fi
+
+    log "依赖安装完成"
+}
+
+# ---------------------------------------------------------------------------
 # 3. 心跳：供外部监控判断存活（watch.py 用它决定是否重建 Pod）
 # ---------------------------------------------------------------------------
 start_heartbeat() {
@@ -132,6 +181,7 @@ main() {
     log "GPU 数: $NUM_GPUS | 工作目录: $WORKSPACE"
 
     start_sshd_if_requested
+    prepare_deps || { log "依赖准备失败，退出"; exit 1; }
     prepare_code || { log "代码准备失败，退出"; exit 1; }
     prepare_data || log "数据准备失败，仍尝试启动训练"
 

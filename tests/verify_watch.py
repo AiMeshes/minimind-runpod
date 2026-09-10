@@ -39,7 +39,15 @@ CONTAINER_DISK_GB=40
 INTERRUPTIBLE=1
 CLOUD_TYPE=COMMUNITY
 PORTS=8888/http,22/tcp
+DATA_URL=https://example.com/data.jsonl
+INSTALL_DEPS=1
+PIP_PACKAGES=transformers==4.57.6 datasets==3.6.0
+TRAIN_ARGS=--epochs 1 --save_interval 50
 """
+
+# 必须被转发进容器 env 的配置项。漏掉任何一项 = 配置静默失效
+# （entrypoint.sh 读不到，会退回默认值而没有任何报错）
+MUST_FORWARD = ["DATA_URL", "INSTALL_DEPS", "PIP_PACKAGES", "TRAIN_ARGS"]
 
 # 取自 https://rest.runpod.io/v1/openapi.json 的 PodCreateInput.properties
 VALID_CREATE_FIELDS = {
@@ -201,6 +209,13 @@ def main() -> int:
     if body.get("env", {}).get("NUM_GPUS") != "8":
         fail(f"env 中 NUM_GPUS 不对: {body.get('env')}")
     ok("挂载 volume + 启用 spot + volumeInGb=0 + GPU/env 正确")
+
+    # 配置必须真的进到容器里 —— 漏转发只会静默退回默认值，不会报错
+    missing = [k for k in MUST_FORWARD if k not in body.get("env", {})]
+    if missing:
+        fail(f"这些配置项没被转发进容器 env: {missing} —— "
+             "entrypoint.sh 会读不到并静默使用默认值")
+    ok(f"{len(MUST_FORWARD)} 项关键配置均已转发进容器 env")
 
     # --- 4. start 失败 → 退回新建 ---
     print("\n── 场景: start 失败（原机器已被占用）──")
