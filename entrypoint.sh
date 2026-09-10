@@ -162,18 +162,39 @@ start_heartbeat() {
 start_sshd_if_requested() {
     [ "${START_SSHD:-0}" = "1" ] || return 0
 
-    mkdir -p /root/.ssh
-    if [ -n "${PUBLIC_KEY:-}" ]; then
-        echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
-        chmod 700 /root/.ssh
-        chmod 600 /root/.ssh/authorized_keys
-        log "已写入 SSH 公钥"
-    else
-        log "START_SSHD=1 但未提供 PUBLIC_KEY，SSH 可能无法登录"
+    # sshd 没有主机密钥就拒绝启动 —— 全新容器里必须先生成。
+    # RunPod 的 /start.sh 本来负责这件事，但我们的 bootstrap 覆盖了 CMD，
+    # 所以要自己做。少了这步的表现是：端口映射存在但连接被拒。
+    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+        ssh-keygen -A >/dev/null 2>&1 && log "已生成 SSH 主机密钥" \
+            || log "主机密钥生成失败"
     fi
 
-    mkdir -p /var/run/sshd
-    /usr/sbin/sshd 2>/dev/null && log "sshd 已启动（端口 22）" || log "sshd 启动失败"
+    mkdir -p /root/.ssh /var/run/sshd
+    if [ -n "${PUBLIC_KEY:-}" ]; then
+        # 去重，避免容器重启后累积重复行
+        touch /root/.ssh/authorized_keys
+        if ! grep -qF "$PUBLIC_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
+            echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+        fi
+        chmod 700 /root/.ssh
+        chmod 600 /root/.ssh/authorized_keys
+        log "SSH 公钥已就位"
+    else
+        log "START_SSHD=1 但未提供 PUBLIC_KEY，SSH 将无法登录"
+    fi
+
+    if /usr/sbin/sshd 2>/dev/null; then
+        # 自检：确认真的在监听，而不是"启动了但立刻退出"
+        sleep 1
+        if ss -tln 2>/dev/null | grep -q ":22 "; then
+            log "sshd 已启动并在 22 端口监听"
+        else
+            log "sshd 进程存在但 22 端口未监听 —— 检查 /etc/ssh/sshd_config"
+        fi
+    else
+        log "sshd 启动失败（可试 /usr/sbin/sshd -d 看详细原因）"
+    fi
 }
 
 # ---------------------------------------------------------------------------
