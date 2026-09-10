@@ -45,6 +45,8 @@ run "断点续训机制（--from_resume 1 是否真的接续）" \
     tests/verify_resume.py "$@"
 run "supervisor 行为（抢占 vs 配置错误的区分）" \
     tests/verify_supervisor.py
+run "watch.py 恢复逻辑（该恢复时恢复、不该动时不动）" \
+    tests/verify_watch.py
 
 echo
 echo "════════════════════════════════════════════════════════════"

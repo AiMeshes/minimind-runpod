@@ -21,7 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from launch import build_pod_request, load_env_file  # noqa: E402
 
-STATE_FILE = Path.home() / ".cache" / "minimind-runpod" / "last_pod_id"
+# 可用环境变量覆盖，便于测试时避免污染用户的 home 目录
+STATE_FILE = Path(os.environ.get(
+    "WATCH_STATE_FILE",
+    Path.home() / ".cache" / "minimind-runpod" / "last_pod_id",
+))
 
 
 def read_last_pod_id():

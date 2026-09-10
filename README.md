@@ -131,7 +131,7 @@ uv pip install --python .venv/bin/python torch transformers==4.57.6 datasets==3.
 bash tests/run_all.sh
 ```
 
-约 40 秒跑完，两项验证：
+约 40 秒跑完，三项验证：
 
 ### 1. 断点续训真的成立吗？
 
@@ -169,6 +169,38 @@ bash tests/run_all.sh
 配置错误是"秒挂"。分不清这两者，要么被抢占后不恢复，要么配置写错时烧钱。
 
 同时做静态检查：`$VAR` 后紧跟非 ASCII 字符在 bash 3.2 下会解析错误（见下）。
+
+### 3. `watch.py` 的判断对不对？
+
+`tests/verify_watch.py` 用假的 `runpod` 模块覆盖每种 Pod 状态。这个脚本判断错了
+只有两种后果，都很贵：**该恢复时不恢复**（训练停摆）或**不该动时乱动**（重复创建，白烧两份钱）。
+
+| Pod 状态 | 期望行为 |
+|---|---|
+| RUNNING | 不做任何写操作 |
+| STOPPED（被抢占） | `start_pod`（保留容器，比重建快） |
+| 不存在 | 新建，且挂载 volume + 启用 spot |
+| STOPPED 但 start 失败 | 退回新建（不卡在启动不了的 Pod 上） |
+| API 查询故障 | 退出 0 且不新建（避免网络抖动导致重复创建） |
+| `--force` | 无视运行中的 Pod 直接新建 |
+
+### 附：构建镜像前的依赖检查
+
+构建一次镜像要拉 10GB，值得先确认依赖装得上：
+
+```bash
+bash tests/check_docker_deps.sh
+```
+
+从 Dockerfile 提取全部包，验证两件事：
+
+1. 在 **linux/amd64 + py3.12** 上可解析（有对应 wheel）—— 本地是 arm64，装了不代表容器里能装
+2. 在 **torch==2.6.0**（基础镜像预装版本）约束下仍可解析
+
+第 2 条是关键：若 `trl` / `transformers` 要求更高的 torch，pip 会在构建时**升级 torch**，
+破坏基础镜像的 CUDA 12.8 配套 —— 而这个过程不会报错，只会让 GPU 跑不起来。
+
+> 当前状态：17 个包全部通过，linux/amd64 上解析出 126 个依赖。
 
 ---
 
