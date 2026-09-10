@@ -169,6 +169,22 @@ def build_pod_request(cfg: dict) -> dict:
     return req
 
 
+def build_update_request(cfg: dict) -> dict:
+    """构造 PATCH /pods/{id} 的请求体，只含 PodUpdateInput 允许修改的字段。
+
+    ⚠️ 这个功能存在的理由：改了 entrypoint.sh 之后需要让容器重新拉取脚本。
+    如果走「终止 + 重建」，新 Pod 大概率落在另一台机器上 ——
+    10GB 镜像的本地缓存全部作废，冷拉要十几分钟。
+    原地更新 + 重启则复用同一台机器，镜像已在本地。
+    """
+    full = build_pod_request(cfg)
+    # PodUpdateInput 允许的字段（见 OpenAPI spec）
+    allowed = {"containerDiskInGb", "containerRegistryAuthId", "dockerEntrypoint",
+               "dockerStartCmd", "env", "globalNetworking", "imageName", "locked",
+               "name", "ports", "volumeInGb", "volumeMountPath"}
+    return {k: v for k, v in full.items() if k in allowed}
+
+
 def cmd_list() -> int:
     pods = api_request("GET", "/pods") or []
     if not pods:
@@ -194,6 +210,8 @@ def main() -> int:
     ap.add_argument("--config", help="配置文件路径")
     ap.add_argument("--dry-run", action="store_true", help="只打印请求，不实际创建")
     ap.add_argument("--list", action="store_true", help="列出所有 Pod 及花费")
+    ap.add_argument("--update", metavar="POD_ID",
+                    help="原地更新已有 Pod 的启动命令并重启（保镜像缓存，不换机器）")
     args = ap.parse_args()
 
     # 必须在任何 API 调用之前
@@ -210,6 +228,29 @@ def main() -> int:
         if not cfg.get(required):
             print(f"错误: 配置缺少 {required}", file=sys.stderr)
             return 1
+
+    # --- 原地更新模式：改启动命令 + 重启，复用同一台机器上的镜像缓存 ---
+    if args.update:
+        patch = build_update_request(cfg)
+        if args.dry_run:
+            print(json.dumps(patch, indent=2, ensure_ascii=False))
+            return 0
+
+        print(f"更新 Pod {args.update} 的启动配置...")
+        api_request("PATCH", f"/pods/{args.update}", patch)
+        print("  已更新")
+        print("重启容器（镜像已在该机器本地，不会重新拉取）...")
+        try:
+            api_request("POST", f"/pods/{args.update}/restart")
+            print("  已重启")
+        except SystemExit:
+            # restart 端点偶尔超时，改用 stop+start（同样复用本地镜像）
+            print("  restart 超时，改用 stop + start...")
+            api_request("POST", f"/pods/{args.update}/stop")
+            api_request("POST", f"/pods/{args.update}/start")
+            print("  已重启")
+        print(f"\n  面板: https://www.console.runpod.io/pods")
+        return 0
 
     req = build_pod_request(cfg)
 
