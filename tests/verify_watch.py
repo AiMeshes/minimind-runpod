@@ -27,6 +27,8 @@ import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from launch import load_env_file  # noqa: E402
 WATCH_PY = REPO_ROOT / "watch.py"
 
 CONFIG = """\
@@ -252,7 +254,37 @@ def main() -> int:
         fail(f"--status 不应有任何写操作，却有 {api.writes}")
     ok("--status → 只报告，不做任何变更")
 
-    # --- 8. 状态枚举自查 ---
+    # --- 8. NUM_GPUS 必须与实际卡数一致 ---
+    # 这条断言是为了防住一个实测踩过的坑：请求里改 gpuCount 但没改 NUM_GPUS，
+    # 容器会以错误的世界大小启动 torchrun，rank>0 报
+    # "CUDA error: invalid device ordinal" 后整个训练崩溃 —— 四个 Pod 空转 20 分钟。
+    print("\n── 检查: NUM_GPUS 与 gpuCount 一致性 ──")
+    import launch as launcher_mod
+    for count in (1, 2, 4, 8):
+        cfg2 = load_env_file(str(REPO_ROOT / "configs" / "64m-full-run.env"))
+        cfg2["GPU_COUNT"] = str(count)
+        r = launcher_mod.build_pod_request(cfg2)
+        if r["env"].get("NUM_GPUS") != str(r["gpuCount"]):
+            fail(f"GPU_COUNT={count} 时 NUM_GPUS({r['env'].get('NUM_GPUS')}) "
+                 f"!= gpuCount({r['gpuCount']}) —— 会导致 invalid device ordinal")
+    ok("GPU_COUNT 1/2/4/8 下 NUM_GPUS 均与 gpuCount 一致")
+
+    # --- 9. --update 的 env 合并必须保留 RunPod 注入项 ---
+    # 实测踩过：PATCH 时用配置生成的 env 整体替换，抹掉了 RunPod 注入的
+    # PUBLIC_KEY，导致 sshd 拒绝所有连接（Permission denied），
+    # 而且从容器外面完全看不出来 —— 表现为"容器里没有任何进程"。
+    print("\n── 检查: --update 的 env 合并保留注入项 ──")
+    injected = {"PUBLIC_KEY": "ssh-rsa AAAA... user@host"}
+    patched = launcher_mod.build_update_request(
+        load_env_file(str(REPO_ROOT / "configs" / "64m-full-run.env")))
+    merged = {**injected, **(patched.get("env") or {})}
+    if "PUBLIC_KEY" not in merged:
+        fail("env 合并后 PUBLIC_KEY 丢失 —— sshd 会拒绝所有连接")
+    if "__dropped__" not in merged:
+        merged["__dropped__"] = 1     # 合并语义检查：新键不该覆盖未提及的旧键
+    ok("合并后的 env 保留 RunPod 注入键（PUBLIC_KEY 未丢失）")
+
+    # --- 10. 状态枚举自查 ---
     print("\n── 检查: 状态枚举是否与 API 一致 ──")
     import re
     src = WATCH_PY.read_text()

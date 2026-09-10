@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -64,10 +65,22 @@ def load_dotenv_if_present() -> None:
 # ---------------------------------------------------------------------------
 # REST 客户端
 # ---------------------------------------------------------------------------
-def api_request(method: str, path: str, body: dict | None = None) -> object:
+# 网络类错误才重试；4xx 是请求本身有问题，重试没意义
+_RETRYABLE_NET_ERRORS = (
+    "Broken pipe", "Connection reset", "Connection refused", "timed out",
+    "Temporary failure", "EOF occurred", "Remote end closed",
+)
+
+
+def api_request(method: str, path: str, body: dict | None = None,
+                retries: int = 3) -> object:
     """调用 RunPod REST API。
 
     User-Agent 是必需的 —— 缺失会被 Cloudflare 以 403 拒绝。
+
+    网络抖动会重试：实测遇到过 Broken pipe / SSL EOF —— 提交类请求
+    （POST /pods）若因抖动失败，用户无从知道资源到底建没建，
+    只能靠事后查列表判断，很容易漏计费。
     """
     api_key = os.environ.get("RUNPOD_API_KEY")
     if not api_key:
@@ -76,23 +89,49 @@ def api_request(method: str, path: str, body: dict | None = None) -> object:
             "写入 .env（见 .env.example）或 export 到环境变量。")
 
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        f"{API_BASE}{path}",
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "minimind-runpod/1.0",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else None
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="ignore")[:500]
-        raise SystemExit(f"API {method} {path} 失败: HTTP {exc.code}\n{detail}") from exc
+    last_net_err = None
+
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(
+            f"{API_BASE}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "minimind-runpod/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="ignore")[:500]
+            # 5xx 可能是临时的，重试；4xx 是请求问题，直接报错
+            if exc.code >= 500 and attempt < retries:
+                last_net_err = f"HTTP {exc.code}: {detail[:120]}"
+            else:
+                raise SystemExit(
+                    f"API {method} {path} 失败: HTTP {exc.code}\n{detail}") from exc
+        except urllib.error.URLError as exc:
+            reason = str(exc.reason)
+            last_net_err = reason
+            if not any(k in reason for k in _RETRYABLE_NET_ERRORS):
+                break
+        except Exception as exc:                     # 含 http.client 层面的 Broken pipe
+            last_net_err = f"{type(exc).__name__}: {exc}"
+            if not any(k in last_net_err for k in _RETRYABLE_NET_ERRORS):
+                break
+
+        if attempt < retries:
+            print(f"  （API {method} {path} 第 {attempt} 次失败: "
+                  f"{last_net_err}；{2 ** attempt}s 后重试）", file=sys.stderr)
+            time.sleep(2 ** attempt)
+
+    raise SystemExit(
+        f"API {method} {path} 重试 {retries} 次仍失败: {last_net_err}\n"
+        f"若这是创建类请求，请用 `python launch.py --list` 确认是否有资源被建出来。")
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +188,12 @@ def build_pod_request(cfg: dict) -> dict:
     if cfg.get("DATA_CENTER_IDS"):
         # network volume 是地域锁定的：Pod 必须在 volume 所在机房
         req["dataCenterIds"] = split_list(cfg["DATA_CENTER_IDS"])
+    if cfg.get("ALLOWED_CUDA_VERSIONS"):
+        # 约束调度到驱动足够新的机器。
+        # 不加这条会踩到：镜像声明 NVIDIA_REQUIRE_CUDA=cuda>=12.8，
+        # 而部分老机器驱动不支持，容器起不来且 RunPod 无限重试 ——
+        # 表现为 Pod RUNNING 但 uptime=0、无端口，只有控制台日志能看到真实原因。
+        req["allowedCudaVersions"] = split_list(cfg["ALLOWED_CUDA_VERSIONS"])
 
     # 用官方镜像时，entrypoint.sh 不在镜像里，需要运行时拉取。
     # 单独用 BOOTSTRAP_URL 而不是通用的 dockerStartCmd，是因为后者按逗号拆分，
@@ -232,6 +277,23 @@ def main() -> int:
     # --- 原地更新模式：改启动命令 + 重启，复用同一台机器上的镜像缓存 ---
     if args.update:
         patch = build_update_request(cfg)
+
+        # ⚠️ env 必须与 Pod 上现有的合并，不能整体替换。
+        # RunPod 在创建 Pod 时自动注入 PUBLIC_KEY（SSH 登录用），
+        # 配置里没有这一项 —— 直接覆盖会把它抹掉，导致 sshd 拒绝所有连接，
+        # 表现为 "Permission denied (publickey)"，而且从容器外面看不出来。
+        try:
+            current = api_request("GET", f"/pods/{args.update}")
+            existing_env = (current or {}).get("env") or {}
+            merged = dict(existing_env)
+            merged.update(patch.get("env", {}))
+            dropped = set(existing_env) - set(merged)
+            patch["env"] = merged
+            if "PUBLIC_KEY" in existing_env:
+                print("  已保留 Pod 上原有的 PUBLIC_KEY（SSH 登录用）")
+        except SystemExit as exc:
+            print(f"  无法读取现有 env，跳过合并（可能导致 PUBLIC_KEY 丢失）: {exc}")
+
         if args.dry_run:
             print(json.dumps(patch, indent=2, ensure_ascii=False))
             return 0
